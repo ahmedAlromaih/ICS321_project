@@ -1,3 +1,7 @@
+USE kfupm_online_store;
+SELECT * FROM customer;
+SELECT * FROM product;
+SELECT * FROM orders;
 CREATE TABLE IF NOT EXISTS customer (
   customer_id INT AUTO_INCREMENT PRIMARY KEY,
   first_name VARCHAR(50) NOT NULL,
@@ -114,3 +118,45 @@ CREATE TABLE IF NOT EXISTS review (
   FOREIGN KEY (product_id) REFERENCES product(product_id),
   UNIQUE (customer_id, product_id)
 );
+SELECT COUNT(*) AS customers FROM customer;
+SELECT COUNT(*) AS products FROM product;
+SELECT COUNT(*) AS orders_count FROM orders;
+ALTER TABLE orders
+  MODIFY order_status ENUM(
+    'pending',
+    'processing',
+    'shipped',
+    'awaiting_customer_confirmation',
+    'delivered',
+    'cancelled'
+  ) NOT NULL,
+  ADD COLUMN seller_confirmed_delivery_at DATETIME NULL AFTER updated_at,
+  ADD COLUMN buyer_confirmed_delivery_at DATETIME NULL AFTER seller_confirmed_delivery_at,
+  ADD COLUMN payout_released_at DATETIME NULL AFTER buyer_confirmed_delivery_at;
+
+CREATE TABLE IF NOT EXISTS seller_wallet (
+  customer_id INT PRIMARY KEY,
+  available_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  pending_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  total_withdrawn DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customer(customer_id)
+);
+
+CREATE TABLE IF NOT EXISTS withdrawal_request (
+  withdrawal_id INT AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  bank_account_name VARCHAR(120) NOT NULL,
+  iban VARCHAR(34) NOT NULL,
+  request_status ENUM('pending', 'processing', 'completed', 'rejected') NOT NULL DEFAULT 'pending',
+  requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  estimated_arrival_at DATETIME NULL,
+  processed_at DATETIME NULL,
+  FOREIGN KEY (customer_id) REFERENCES customer(customer_id),
+  CHECK (amount > 0)
+);
+SELECT * FROM orders ORDER BY order_id DESC;
+SELECT * FROM seller_wallet;
+SELECT * FROM withdrawal_request ORDER BY withdrawal_id DESC;
+SHOW TABLES;

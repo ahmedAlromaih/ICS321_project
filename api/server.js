@@ -75,6 +75,7 @@ async function handleApi(req, res, url) {
         '/api/cart',
         '/api/orders',
         '/api/reviews',
+        '/api/wallet',
       ],
     });
     return;
@@ -96,6 +97,7 @@ async function handleApi(req, res, url) {
       'cart',
       'orders',
       'reviews',
+      'wallet',
     ].includes(routeName)
   ) {
     await handleStoreRoute(req, res, routeName);

@@ -142,14 +142,38 @@ type Order = {
   seller_total_amount?: string | number;
   item_count: number;
   items: string | null;
+  seller_confirmed_delivery_at?: string | null;
+  buyer_confirmed_delivery_at?: string | null;
+  payout_released_at?: string | null;
 };
 
 type Review = {
   review_id: number;
+  product_id: number;
   rating: number;
   comment: string;
   product_name: string;
   customer_name: string;
+};
+
+type SellerWallet = {
+  customer_id: number;
+  available_balance: string | number;
+  pending_balance: string | number;
+  total_withdrawn: string | number;
+  updated_at: string;
+  withdrawals: WithdrawalRequest[];
+};
+
+type WithdrawalRequest = {
+  withdrawal_id: number;
+  amount: string | number;
+  bank_account_name: string;
+  iban: string;
+  request_status: string;
+  requested_at: string;
+  estimated_arrival_at?: string | null;
+  processed_at?: string | null;
 };
 
 const currency = new Intl.NumberFormat('en-SA', {
@@ -339,6 +363,14 @@ export default function App() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [sellerOrders, setSellerOrders] = useState<Order[]>([]);
   const [reviews, setReviews] = useState<Review[]>([]);
+  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [productReviews, setProductReviews] = useState<Review[]>([]);
+  const [wallet, setWallet] = useState<SellerWallet | null>(null);
+  const [withdrawalForm, setWithdrawalForm] = useState({
+    amount: '',
+    bank_account_name: '',
+    iban: '',
+  });
   const [selectedCategory, setSelectedCategory] = useState<number | 'all'>('all');
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [search, setSearch] = useState('');
@@ -356,12 +388,13 @@ export default function App() {
 
   const visibleProducts = useMemo(() => {
     const text = search.trim().toLowerCase();
+    const customerVisible = products.filter((product) => product.stock_status !== 'out');
 
     if (!text) {
-      return products;
+      return customerVisible;
     }
 
-    return products.filter((product) =>
+    return customerVisible.filter((product) =>
       [product.name, product.description, product.category_name]
         .join(' ')
         .toLowerCase()
@@ -430,6 +463,21 @@ export default function App() {
     setSellerOrders(rows);
   }
 
+  async function loadWallet(customerId: number) {
+    const rows = await readJson<SellerWallet>(
+      await fetch(`/api/wallet?customer_id=${customerId}`),
+    );
+    setWallet(rows);
+  }
+
+  async function openProductDetails(product: Product) {
+    setSelectedProduct(product);
+    const rows = await readJson<Review[]>(
+      await fetch(`/api/reviews?product_id=${product.product_id}`),
+    );
+    setProductReviews(rows);
+  }
+
   async function loadBaseData(nextSession = session) {
     if (!nextSession) {
       return;
@@ -473,10 +521,12 @@ export default function App() {
           loadCart(nextSession.customer.customer_id),
           loadOrders(nextSession.customer.customer_id),
           loadSellerOrders(nextSession.customer.customer_id),
+          loadWallet(nextSession.customer.customer_id),
         ]);
       } else {
         setCart(null);
         setSellerOrders([]);
+        setWallet(null);
         await loadOrders();
       }
     } catch (error) {
@@ -569,6 +619,10 @@ export default function App() {
     setCustomers([]);
     setOrders([]);
     setSellerOrders([]);
+    setSelectedProduct(null);
+    setProductReviews([]);
+    setWallet(null);
+    setWithdrawalForm({ amount: '', bank_account_name: '', iban: '' });
     setSellProductForm(emptySellProduct);
     setAccountForm(emptyAccountForm);
     setProductEditForms({});
@@ -853,12 +907,84 @@ export default function App() {
       );
 
       await loadBaseData(session);
-      setNotice({ tone: 'success', message: `Order #${orderId} marked as delivered.` });
+      setNotice({
+        tone: 'success',
+        message: `Order #${orderId} is waiting for customer confirmation.`,
+      });
     } catch (error) {
       setNotice({
         tone: 'error',
         message:
           error instanceof Error ? error.message : 'Unable to confirm delivery.',
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function confirmReceipt(orderId: number) {
+    if (!customer) {
+      return;
+    }
+
+    setIsBusy(true);
+    setNotice(null);
+
+    try {
+      await readJson(
+        await fetch('/api/orders', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'confirm_receipt',
+            order_id: orderId,
+            customer_id: customer.customer_id,
+          }),
+        }),
+      );
+
+      await loadBaseData(session);
+      await loadWallet(customer.customer_id);
+      setNotice({ tone: 'success', message: `Order #${orderId} confirmed.` });
+    } catch (error) {
+      setNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Unable to confirm receipt.',
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function withdrawCredit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!customer) {
+      return;
+    }
+
+    setIsBusy(true);
+    setNotice(null);
+
+    try {
+      const result = await readJson<{ message: string }>(
+        await fetch('/api/wallet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customer_id: customer.customer_id,
+            ...withdrawalForm,
+          }),
+        }),
+      );
+
+      await loadWallet(customer.customer_id);
+      setWithdrawalForm({ amount: '', bank_account_name: '', iban: '' });
+      setNotice({ tone: 'success', message: result.message });
+    } catch (error) {
+      setNotice({
+        tone: 'error',
+        message:
+          error instanceof Error ? error.message : 'Unable to request withdrawal.',
       });
     } finally {
       setIsBusy(false);
@@ -993,6 +1119,7 @@ export default function App() {
     return (
       <SettingsPage
         customer={customer}
+        isBusy={isBusy}
         notice={notice}
         orders={orders}
         tab={settingsTab}
@@ -1000,6 +1127,7 @@ export default function App() {
           setNotice(null);
           setView('shop');
         }}
+        onConfirmReceipt={confirmReceipt}
         onEditAccount={openAccountUpdate}
         onOpenMyProducts={() => {
           setNotice(null);
@@ -1042,6 +1170,8 @@ export default function App() {
         orders={sellerOrders}
         productForms={productEditForms}
         products={myProducts}
+        wallet={wallet}
+        withdrawalForm={withdrawalForm}
         onBack={() => {
           setNotice(null);
           setView('settings');
@@ -1053,6 +1183,8 @@ export default function App() {
         onSignOut={signOut}
         onSubmitProduct={submitProduct}
         onUpdateProduct={updateProduct}
+        onChangeWithdrawalForm={setWithdrawalForm}
+        onWithdraw={withdrawCredit}
       />
     );
   }
@@ -1088,6 +1220,8 @@ export default function App() {
       reviews={reviews}
       search={search}
       selectedCategory={selectedCategory}
+      selectedProduct={selectedProduct}
+      productReviews={productReviews}
       summary={summary}
       onAddToCart={addToCart}
       onChangeQuantity={changeQuantity}
@@ -1100,6 +1234,9 @@ export default function App() {
         setNotice(null);
         setView('settings');
       }}
+      onConfirmReceipt={confirmReceipt}
+      onOpenProduct={openProductDetails}
+      onCloseProduct={() => setSelectedProduct(null)}
       onSignOut={signOut}
     />
   );
@@ -1285,12 +1422,17 @@ function ShopPage({
   onSearch,
   onSelectCategory,
   onSettings,
+  onConfirmReceipt,
+  onOpenProduct,
+  onCloseProduct,
   onSignOut,
   orders,
   products,
   reviews,
   search,
   selectedCategory,
+  selectedProduct,
+  productReviews,
   summary,
 }: {
   cart: Cart | null;
@@ -1304,6 +1446,8 @@ function ShopPage({
   reviews: Review[];
   search: string;
   selectedCategory: number | 'all';
+  selectedProduct: Product | null;
+  productReviews: Review[];
   summary: Summary | null;
   onAddToCart: (productId: number) => void;
   onChangeQuantity: (item: CartItem, quantity: number) => void;
@@ -1313,6 +1457,9 @@ function ShopPage({
   onSearch: (value: string) => void;
   onSelectCategory: (value: number | 'all') => void;
   onSettings: () => void;
+  onConfirmReceipt: (orderId: number) => void;
+  onOpenProduct: (product: Product) => void;
+  onCloseProduct: () => void;
   onSignOut: () => void;
 }) {
   return (
@@ -1351,6 +1498,7 @@ function ShopPage({
                   key={product.product_id}
                   product={product}
                   onAddToCart={onAddToCart}
+                  onOpenProduct={onOpenProduct}
                 />
               ))}
             </div>
@@ -1365,11 +1513,20 @@ function ShopPage({
             onCheckout={onCheckout}
             onRemoveFromCart={onRemoveFromCart}
           />
-          <OrdersPanel orders={orders} />
+          <OrdersPanel
+            isBusy={isBusy}
+            orders={orders}
+            onConfirmReceipt={onConfirmReceipt}
+          />
         </aside>
       </section>
 
       <BottomInfo categories={categories} reviews={reviews} />
+      <ProductReviewsModal
+        product={selectedProduct}
+        reviews={productReviews}
+        onClose={onCloseProduct}
+      />
     </main>
   );
 }
@@ -1580,8 +1737,10 @@ function AdminPage({
 
 function SettingsPage({
   customer,
+  isBusy,
   notice,
   onBack,
+  onConfirmReceipt,
   onEditAccount,
   onOpenMyProducts,
   onRefresh,
@@ -1591,10 +1750,12 @@ function SettingsPage({
   tab,
 }: {
   customer: Customer | null;
+  isBusy: boolean;
   notice: Notice | null;
   orders: Order[];
   tab: SettingsTab;
   onBack: () => void;
+  onConfirmReceipt: (orderId: number) => void;
   onEditAccount: () => void;
   onOpenMyProducts: () => void;
   onRefresh: () => void;
@@ -1642,7 +1803,7 @@ function SettingsPage({
           {tab === 'account' ? (
             <AccountSettings customer={customer} onEdit={onEditAccount} />
           ) : null}
-          {tab === 'orders' ? <OrdersPanel orders={orders} /> : null}
+          {tab === 'orders' ? <OrdersPanel isBusy={isBusy} orders={orders} onConfirmReceipt={onConfirmReceipt} /> : null}
         </div>
       </section>
     </main>
@@ -1814,9 +1975,13 @@ function SellerProductsPage({
   onSignOut,
   onSubmitProduct,
   onUpdateProduct,
+  onChangeWithdrawalForm,
+  onWithdraw,
   orders,
   productForms,
   products,
+  wallet,
+  withdrawalForm,
 }: {
   categories: Category[];
   customer: Customer | null;
@@ -1826,6 +1991,12 @@ function SellerProductsPage({
   orders: Order[];
   productForms: Record<number, ProductEditForm>;
   products: Product[];
+  wallet: SellerWallet | null;
+  withdrawalForm: {
+    amount: string;
+    bank_account_name: string;
+    iban: string;
+  };
   onBack: () => void;
   onChangeForm: (form: typeof emptySellProduct) => void;
   onChangeProductForm: (productId: number, changes: Partial<ProductEditForm>) => void;
@@ -1834,6 +2005,12 @@ function SellerProductsPage({
   onSignOut: () => void;
   onSubmitProduct: (event: FormEvent<HTMLFormElement>) => void;
   onUpdateProduct: (productId: number) => void;
+  onChangeWithdrawalForm: (form: {
+    amount: string;
+    bank_account_name: string;
+    iban: string;
+  }) => void;
+  onWithdraw: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   return (
     <main className="min-h-screen bg-[#f5f7fb] text-[#172033]">
@@ -1953,6 +2130,38 @@ function SellerProductsPage({
             ) : null}
           </section>
 
+          <div className="rounded-lg border border-[#dce3ee] bg-white p-5 shadow-sm">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-[#101828]">Seller Credit</h2>
+                <p className="mt-1 text-sm text-[#647084]">Withdrawals take 4 working days.</p>
+              </div>
+              <CreditCard className="h-5 w-5 text-[#1f7a68]" />
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-3">
+              <ReadOnlyField label="Available" value={formatMoney(wallet?.available_balance ?? 0)} />
+              <ReadOnlyField label="Pending" value={formatMoney(wallet?.pending_balance ?? 0)} />
+              <ReadOnlyField label="Total withdrawn" value={formatMoney(wallet?.total_withdrawn ?? 0)} />
+            </div>
+
+            <form className="mt-5 grid gap-3 md:grid-cols-3" onSubmit={onWithdraw}>
+              <Field label="Amount" inputMode="numeric" value={withdrawalForm.amount} onChange={(value) => onChangeWithdrawalForm({ ...withdrawalForm, amount: value })} />
+              <Field label="Account name" value={withdrawalForm.bank_account_name} onChange={(value) => onChangeWithdrawalForm({ ...withdrawalForm, bank_account_name: value })} />
+              <Field label="IBAN" value={withdrawalForm.iban} onChange={(value) => onChangeWithdrawalForm({ ...withdrawalForm, iban: value })} />
+              <div className="md:col-span-3">
+                <button
+                  className="inline-flex h-11 items-center justify-center gap-2 rounded-md bg-[#2b5c9e] px-4 text-sm font-semibold text-white transition hover:bg-[#244f89] disabled:opacity-60"
+                  disabled={isBusy}
+                  type="submit"
+                >
+                  <CreditCard className="h-4 w-4" />
+                  Withdraw to bank account
+                </button>
+              </div>
+            </form>
+          </div>
+
           <section className="rounded-lg border border-[#dce3ee] bg-white p-5 shadow-sm">
             <div className="mb-5 flex items-center justify-between">
               <div>
@@ -2002,7 +2211,7 @@ function SellerProductsPage({
                     ) : null}
                     <button
                       className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-[#1f7a68] px-3 text-sm font-semibold text-white transition hover:bg-[#196858] disabled:cursor-not-allowed disabled:opacity-60"
-                      disabled={isBusy || ['delivered', 'cancelled'].includes(order.order_status)}
+                      disabled={isBusy || ['awaiting_customer_confirmation', 'delivered', 'cancelled'].includes(order.order_status)}
                       type="button"
                       onClick={() => onConfirmDelivery(order.order_id)}
                     >
@@ -2276,28 +2485,40 @@ function CatalogToolbar({
 function ProductCard({
   isBusy,
   onAddToCart,
+  onOpenProduct,
   product,
   showAction = true,
 }: {
   isBusy: boolean;
   product: Product;
   onAddToCart: (productId: number) => void;
+  onOpenProduct?: (product: Product) => void;
   showAction?: boolean;
 }) {
   return (
     <article className="overflow-hidden rounded-lg border border-[#dce3ee] bg-white shadow-sm">
-      <div className="aspect-[16/10] overflow-hidden bg-[#dfe7f2]">
+      <button
+        className="aspect-[16/10] w-full overflow-hidden bg-[#dfe7f2]"
+        type="button"
+        onClick={() => onOpenProduct?.(product)}
+      >
         <ImageWithFallback
           className="h-full w-full object-cover"
           src={productImage(product)}
           alt={product.name}
         />
-      </div>
+      </button>
       <div className="space-y-4 p-4">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <span className="text-sm font-medium text-[#1f7a68]">{product.category_name}</span>
-            <h2 className="mt-1 truncate text-lg font-semibold text-[#101828]">{product.name}</h2>
+            <button
+              className="mt-1 truncate text-left text-lg font-semibold text-[#101828] transition hover:text-[#1f7a68]"
+              type="button"
+              onClick={() => onOpenProduct?.(product)}
+            >
+              {product.name}
+            </button>
           </div>
           <span className="whitespace-nowrap text-lg font-semibold text-[#2b5c9e]">{formatMoney(product.price)}</span>
         </div>
@@ -2413,7 +2634,15 @@ function CartPanel({
   );
 }
 
-function OrdersPanel({ orders }: { orders: Order[] }) {
+function OrdersPanel({
+  isBusy,
+  onConfirmReceipt,
+  orders,
+}: {
+  isBusy: boolean;
+  onConfirmReceipt: (orderId: number) => void;
+  orders: Order[];
+}) {
   return (
     <div className="rounded-lg border border-[#dce3ee] bg-white p-5 shadow-sm">
       <div className="mb-4 flex items-center justify-between">
@@ -2432,6 +2661,17 @@ function OrdersPanel({ orders }: { orders: Order[] }) {
               <span className={`rounded-md px-2 py-1 capitalize ${statusTone(order.order_status)}`}>{order.order_status}</span>
               <span className={`rounded-md px-2 py-1 capitalize ${statusTone(order.payment_status)}`}>{order.payment_status}</span>
             </div>
+            {order.seller_confirmed_delivery_at && !order.buyer_confirmed_delivery_at ? (
+              <button
+                className="mt-3 inline-flex h-9 items-center justify-center gap-2 rounded-md bg-[#1f7a68] px-3 text-xs font-semibold text-white transition hover:bg-[#186454] disabled:opacity-60"
+                disabled={isBusy}
+                type="button"
+                onClick={() => onConfirmReceipt(order.order_id)}
+              >
+                <CheckCircle2 className="h-4 w-4" />
+                Confirm receipt
+              </button>
+            ) : null}
           </div>
         ))}
         {orders.length === 0 ? <p className="text-sm text-[#647084]">No orders yet.</p> : null}
@@ -2487,6 +2727,67 @@ function ConditionSelect({
         <option value="used">used</option>
       </select>
     </label>
+  );
+}
+
+function ProductReviewsModal({
+  product,
+  reviews,
+  onClose,
+}: {
+  product: Product | null;
+  reviews: Review[];
+  onClose: () => void;
+}) {
+  if (!product) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-5" onClick={onClose}>
+      <div className="max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-xl bg-white p-6 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-2xl font-semibold text-[#101828]">{product.name}</h2>
+            <p className="mt-1 text-sm text-[#647084]">{product.description}</p>
+          </div>
+          <button className="rounded-md border border-[#dce3ee] p-2" type="button" onClick={onClose}>
+            <XCircle className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="mb-5 rounded-lg border border-[#e2e8f0] bg-[#f8fafc] p-4">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-[#647084]">Price</span>
+            <span className="text-lg font-semibold text-[#101828]">{formatMoney(product.price)}</span>
+          </div>
+          <div className="mt-2 flex items-center justify-between">
+            <span className="text-sm text-[#647084]">Rating</span>
+            <span className="inline-flex items-center gap-1 text-sm font-semibold text-[#7a5a00]">
+              <Star className="h-4 w-4 fill-current" />
+              {Number(product.average_rating).toFixed(1)} ({product.review_count})
+            </span>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          {reviews.length ? reviews.map((review) => (
+            <article className="rounded-md border border-[#e2e8f0] bg-[#fbfcfe] p-4" key={review.review_id}>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold text-[#172033]">{review.customer_name}</span>
+                <span className="inline-flex items-center gap-1 text-sm font-semibold text-[#7a5a00]">
+                  <Star className="h-4 w-4 fill-current" />
+                  {review.rating}
+                </span>
+              </div>
+              <p className="mt-2 text-sm leading-6 text-[#647084]">{review.comment}</p>
+            </article>
+          )) : (
+            <p className="text-sm text-[#647084]">No reviews yet for this product.</p>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 

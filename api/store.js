@@ -83,7 +83,7 @@ const schemaStatements = [
     customer_id INT NOT NULL,
     address_id INT NOT NULL,
     order_date DATETIME NOT NULL,
-    order_status ENUM('pending', 'processing', 'shipped', 'delivered', 'cancelled'),
+    order_status ENUM('pending', 'processing', 'shipped', 'awaiting_customer_confirmation', 'delivered', 'cancelled'),
     payment_status ENUM('unpaid', 'paid', 'refunded'),
     payment_method VARCHAR(50),
     total_amount DECIMAL(10,2),
@@ -219,6 +219,30 @@ async function ensureColumn(tableName, columnName, definition) {
   if (Number(result.column_count) === 0) {
     await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${definition}`);
   }
+}
+
+async function ensureWallet(customerId, connection = pool) {
+  await connection.query(
+    `INSERT INTO seller_wallet (customer_id, available_balance, pending_balance, total_withdrawn, updated_at)
+     VALUES (?, 0, 0, 0, NOW())
+     ON DUPLICATE KEY UPDATE updated_at = updated_at`,
+    [customerId],
+  );
+}
+
+function addWorkingDays(startDate, days) {
+  const result = new Date(startDate);
+  let added = 0;
+
+  while (added < days) {
+    result.setDate(result.getDate() + 1);
+    const day = result.getDay();
+    if (day !== 0 && day !== 6) {
+      added += 1;
+    }
+  }
+
+  return result;
 }
 
 function parseBody(req) {
@@ -357,6 +381,61 @@ async function setupStore() {
         'product_condition',
         "product_condition ENUM('new', 'used') DEFAULT 'new'",
       );
+
+      await ensureColumn(
+        'orders',
+        'seller_confirmed_delivery_at',
+        'seller_confirmed_delivery_at DATETIME NULL',
+      );
+      await ensureColumn(
+        'orders',
+        'buyer_confirmed_delivery_at',
+        'buyer_confirmed_delivery_at DATETIME NULL',
+      );
+      await ensureColumn(
+        'orders',
+        'payout_released_at',
+        'payout_released_at DATETIME NULL',
+      );
+
+      await pool.query(`
+        ALTER TABLE orders
+        MODIFY COLUMN order_status ENUM(
+          'pending',
+          'processing',
+          'shipped',
+          'awaiting_customer_confirmation',
+          'delivered',
+          'cancelled'
+        )
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS seller_wallet (
+          customer_id INT PRIMARY KEY,
+          available_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+          pending_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+          total_withdrawn DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (customer_id) REFERENCES customer(customer_id)
+        )
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS withdrawal_request (
+          withdrawal_id INT AUTO_INCREMENT PRIMARY KEY,
+          customer_id INT NOT NULL,
+          amount DECIMAL(10,2) NOT NULL,
+          bank_account_name VARCHAR(120) NOT NULL,
+          iban VARCHAR(34) NOT NULL,
+          request_status ENUM('pending', 'processing', 'completed', 'rejected') NOT NULL DEFAULT 'pending',
+          requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          estimated_arrival_at DATETIME NULL,
+          processed_at DATETIME NULL,
+          FOREIGN KEY (customer_id) REFERENCES customer(customer_id),
+          CHECK (amount > 0)
+        )
+      `);
 
       const [[{ customer_count }]] = await pool.query(
         'SELECT COUNT(*) AS customer_count FROM customer',
@@ -501,6 +580,8 @@ async function createProduct(req, res) {
       VALUES (?, ?, 2, ?, NOW())`,
       [productId, quantity, stockStatus],
     );
+
+    await ensureWallet(customerId, connection);
 
     await connection.commit();
 
@@ -761,6 +842,7 @@ async function signUp(req, res) {
     );
 
     await getOrCreateCart(customerId, connection);
+    await ensureWallet(customerId, connection);
     await connection.commit();
 
     return res.status(201).json({
@@ -1074,6 +1156,9 @@ async function listOrders(req, res) {
       o.payment_status,
       o.payment_method,
       CAST(o.total_amount AS DECIMAL(10,2)) AS total_amount,
+      o.seller_confirmed_delivery_at,
+      o.buyer_confirmed_delivery_at,
+      o.payout_released_at,
       CAST(COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS DECIMAL(10,2)) AS seller_total_amount,
       COUNT(oi.product_id) AS item_count,
       GROUP_CONCAT(CONCAT(p.name, ' x', oi.quantity) ORDER BY p.name SEPARATOR ', ') AS items
@@ -1084,7 +1169,8 @@ async function listOrders(req, res) {
     ${whereClause}
     GROUP BY
       o.order_id, o.customer_id, c.first_name, c.last_name, c.email, c.phone, o.order_date,
-      o.order_status, o.payment_status, o.payment_method, o.total_amount
+      o.order_status, o.payment_status, o.payment_method, o.total_amount,
+      o.seller_confirmed_delivery_at, o.buyer_confirmed_delivery_at, o.payout_released_at
     ORDER BY o.order_date DESC, o.order_id DESC
     LIMIT 20`,
     params,
@@ -1154,8 +1240,21 @@ async function createOrder(req, res) {
     );
     const [orderResult] = await connection.query(
       `INSERT INTO orders
-        (customer_id, address_id, order_date, order_status, payment_status, payment_method, total_amount, created_at, updated_at)
-      VALUES (?, ?, NOW(), 'pending', ?, ?, ?, NOW(), NOW())`,
+        (
+          customer_id,
+          address_id,
+          order_date,
+          order_status,
+          payment_status,
+          payment_method,
+          total_amount,
+          created_at,
+          updated_at,
+          seller_confirmed_delivery_at,
+          buyer_confirmed_delivery_at,
+          payout_released_at
+        )
+      VALUES (?, ?, NOW(), 'pending', ?, ?, ?, NOW(), NOW(), NULL, NULL, NULL)`,
       [customerId, address.address_id, paymentStatus, paymentMethod, total],
     );
     const orderId = orderResult.insertId;
@@ -1199,7 +1298,7 @@ async function createOrder(req, res) {
   }
 }
 
-async function confirmDelivery(req, res) {
+async function sellerConfirmDelivery(req, res) {
   const body = parseBody(req);
   const orderId = readPositiveInt(body.order_id || req.query?.order_id, 'order_id');
   const customerId = readPositiveInt(body.customer_id, 'customer_id');
@@ -1209,16 +1308,13 @@ async function confirmDelivery(req, res) {
     await connection.beginTransaction();
 
     const [[order]] = await connection.query(
-      `SELECT
-        o.order_id,
-        o.order_status
-      FROM orders o
-      JOIN order_item oi ON oi.order_id = o.order_id
-      JOIN product p ON p.product_id = oi.product_id
-      WHERE o.order_id = ?
-        AND p.seller_customer_id = ?
-      LIMIT 1
-      FOR UPDATE`,
+      `SELECT o.order_id, o.order_status, o.seller_confirmed_delivery_at
+       FROM orders o
+       JOIN order_item oi ON oi.order_id = o.order_id
+       JOIN product p ON p.product_id = oi.product_id
+       WHERE o.order_id = ? AND p.seller_customer_id = ?
+       LIMIT 1
+       FOR UPDATE`,
       [orderId, customerId],
     );
 
@@ -1229,15 +1325,95 @@ async function confirmDelivery(req, res) {
     }
 
     if (order.order_status === 'cancelled') {
-      const error = new Error('Cancelled orders cannot be marked delivered.');
+      const error = new Error('Cancelled orders cannot be confirmed.');
       error.statusCode = 409;
       throw error;
     }
 
     await connection.query(
       `UPDATE orders
-      SET order_status = 'delivered', updated_at = NOW()
-      WHERE order_id = ?`,
+       SET order_status = 'awaiting_customer_confirmation',
+           seller_confirmed_delivery_at = NOW(),
+           updated_at = NOW()
+       WHERE order_id = ?`,
+      [orderId],
+    );
+
+    await connection.commit();
+    return res.json({
+      order_id: orderId,
+      order_status: 'awaiting_customer_confirmation',
+      seller_confirmed_delivery_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function buyerConfirmDelivery(req, res) {
+  const body = parseBody(req);
+  const orderId = readPositiveInt(body.order_id || req.query?.order_id, 'order_id');
+  const customerId = readPositiveInt(body.customer_id, 'customer_id');
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [[order]] = await connection.query(
+      `SELECT order_id, customer_id, payment_status, order_status, seller_confirmed_delivery_at, buyer_confirmed_delivery_at
+       FROM orders
+       WHERE order_id = ?
+       FOR UPDATE`,
+      [orderId],
+    );
+
+    if (!order || Number(order.customer_id) !== customerId) {
+      const error = new Error('Customer order was not found.');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (!order.seller_confirmed_delivery_at) {
+      const error = new Error('Seller must confirm delivery first.');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    if (order.buyer_confirmed_delivery_at) {
+      await connection.commit();
+      return res.json({ order_id: orderId, order_status: 'delivered' });
+    }
+
+    const [sellerRows] = await connection.query(
+      `SELECT p.seller_customer_id, SUM(oi.quantity * oi.unit_price) AS seller_amount
+       FROM order_item oi
+       JOIN product p ON p.product_id = oi.product_id
+       WHERE oi.order_id = ? AND p.seller_customer_id IS NOT NULL
+       GROUP BY p.seller_customer_id`,
+      [orderId],
+    );
+
+    for (const sellerRow of sellerRows) {
+      await ensureWallet(sellerRow.seller_customer_id, connection);
+      await connection.query(
+        `UPDATE seller_wallet
+         SET available_balance = available_balance + ?,
+             updated_at = NOW()
+         WHERE customer_id = ?`,
+        [Number(sellerRow.seller_amount || 0), sellerRow.seller_customer_id],
+      );
+    }
+
+    await connection.query(
+      `UPDATE orders
+       SET order_status = 'delivered',
+           buyer_confirmed_delivery_at = NOW(),
+           payout_released_at = NOW(),
+           updated_at = NOW()
+       WHERE order_id = ?`,
       [orderId],
     );
 
@@ -1253,11 +1429,6 @@ async function confirmDelivery(req, res) {
 
 async function cancelOrder(req, res) {
   const body = parseBody(req);
-
-  if (body.action === 'confirm_delivery') {
-    return confirmDelivery(req, res);
-  }
-
   const orderId = readPositiveInt(body.order_id || req.query?.order_id, 'order_id');
   const connection = await pool.getConnection();
 
@@ -1324,20 +1495,116 @@ async function cancelOrder(req, res) {
   }
 }
 
+async function getWallet(req, res) {
+  const customerId = readPositiveInt(req.query?.customer_id, 'customer_id');
+  await ensureWallet(customerId);
+
+  const [[wallet]] = await pool.query(
+    `SELECT customer_id, available_balance, pending_balance, total_withdrawn, updated_at
+     FROM seller_wallet
+     WHERE customer_id = ?`,
+    [customerId],
+  );
+
+  const [withdrawals] = await pool.query(
+    `SELECT withdrawal_id, amount, bank_account_name, iban, request_status, requested_at, estimated_arrival_at, processed_at
+     FROM withdrawal_request
+     WHERE customer_id = ?
+     ORDER BY requested_at DESC`,
+    [customerId],
+  );
+
+  return res.json({ ...wallet, withdrawals });
+}
+
+async function requestWithdrawal(req, res) {
+  const body = parseBody(req);
+  const customerId = readPositiveInt(body.customer_id, 'customer_id');
+  const amount = readPrice(body.amount);
+  const bankAccountName = readString(body, 'bank_account_name', 'Account name', 120);
+  const iban = readString(body, 'iban', 'IBAN', 34);
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    await ensureWallet(customerId, connection);
+
+    const [[wallet]] = await connection.query(
+      `SELECT available_balance, total_withdrawn
+       FROM seller_wallet
+       WHERE customer_id = ?
+       FOR UPDATE`,
+      [customerId],
+    );
+
+    if (!wallet || Number(wallet.available_balance) < amount) {
+      const error = new Error('Available credit is not enough for this withdrawal.');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const estimatedArrival = addWorkingDays(new Date(), 4)
+      .toISOString()
+      .slice(0, 19)
+      .replace('T', ' ');
+
+    const [result] = await connection.query(
+      `INSERT INTO withdrawal_request
+       (customer_id, amount, bank_account_name, iban, request_status, requested_at, estimated_arrival_at)
+       VALUES (?, ?, ?, ?, 'pending', NOW(), ?)`,
+      [customerId, amount, bankAccountName, iban, estimatedArrival],
+    );
+
+    await connection.query(
+      `UPDATE seller_wallet
+       SET available_balance = available_balance - ?,
+           total_withdrawn = total_withdrawn + ?,
+           updated_at = NOW()
+       WHERE customer_id = ?`,
+      [amount, amount, customerId],
+    );
+
+    await connection.commit();
+    return res.status(201).json({
+      withdrawal_id: result.insertId,
+      amount,
+      request_status: 'pending',
+      estimated_arrival_at: estimatedArrival,
+      message: 'Withdrawal requested. Bank transfer takes 4 working days.',
+    });
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 async function listReviews(req, res) {
+  const productId = readOptionalPositiveInt(req.query?.product_id, 'product_id');
+  const params = [];
+  const whereClause = productId ? 'WHERE r.product_id = ?' : '';
+
+  if (productId) {
+    params.push(productId);
+  }
+
   const [rows] = await pool.query(
     `SELECT
       r.review_id,
+      r.product_id,
       r.rating,
       r.comment,
       r.created_at,
       p.name AS product_name,
       CONCAT(c.first_name, ' ', c.last_name) AS customer_name
-    FROM review r
-    JOIN product p ON p.product_id = r.product_id
-    JOIN customer c ON c.customer_id = r.customer_id
-    ORDER BY r.created_at DESC, r.review_id DESC
-    LIMIT 10`,
+     FROM review r
+     JOIN product p ON p.product_id = r.product_id
+     JOIN customer c ON c.customer_id = r.customer_id
+     ${whereClause}
+     ORDER BY r.created_at DESC, r.review_id DESC
+     LIMIT 20`,
+    params,
   );
 
   return res.json(rows);
@@ -1465,11 +1732,29 @@ export async function handleStoreRoute(req, res, routeName) {
     }
 
     if (routeName === 'orders' && req.method === 'PATCH') {
+      const body = parseBody(req);
+
+      if (body.action === 'confirm_delivery') {
+        return await sellerConfirmDelivery(req, res);
+      }
+
+      if (body.action === 'confirm_receipt') {
+        return await buyerConfirmDelivery(req, res);
+      }
+
       return await cancelOrder(req, res);
     }
 
     if (routeName === 'reviews' && req.method === 'GET') {
       return await listReviews(req, res);
+    }
+
+    if (routeName === 'wallet' && req.method === 'GET') {
+      return await getWallet(req, res);
+    }
+
+    if (routeName === 'wallet' && req.method === 'POST') {
+      return await requestWithdrawal(req, res);
     }
 
     return res.status(405).json({ error: 'Method not allowed for this route.' });
